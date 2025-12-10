@@ -35,6 +35,13 @@ module.exports = () => {
         "Welcome to Prempackaging. Visit - https://prempackaging.com for more details."
       );
     });
+    router.get("/health", (req, res) => {
+      return res.status(200).json({
+        status: "ok",
+        message: "Prempackaging backend is running smoothly",
+        timestamp: new Date().toISOString(),
+      });
+    });
 
     app.use("/premind", healthRouter);
     app.use("/premind/api", rootRouter);
