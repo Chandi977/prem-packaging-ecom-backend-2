@@ -588,7 +588,7 @@ exports.createPayment = async (req, res) => {
       console.error("Error creating order:", err);
       return res.status(500).json({ error: "Error creating order" });
     }
-    //console.log("Order created:", order);
+    console.log("Order created:", order);
     res.json(order);
   });
 };
