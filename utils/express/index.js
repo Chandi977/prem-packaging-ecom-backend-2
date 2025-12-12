@@ -61,7 +61,9 @@ const parseWhitelist = (raw = "") =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-const whitelist = parseWhitelist(process.env.CORS_WHITELIST || "");
+const whitelist = parseWhitelist(
+  process.env.CORS_WHITELIST || "http://localhost:3000"
+);
 const isOriginAllowed = (origin) => {
   if (!origin) return true; // allow non-browser tools (curl/postman)
   return whitelist.includes(origin);
