@@ -27,7 +27,7 @@ module.exports = () => {
         origin: [
           "https://www.store.prempackaging.com",
           "http://localhost:3000",
-          "https://prem-packaging-ecom-frontend-9fab2c.vercel.app/",
+          "https://prem-packaging-ecom-frontend-9fab2c.vercel.app",
         ],
         credentials: true,
       })
