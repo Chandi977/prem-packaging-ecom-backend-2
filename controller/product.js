@@ -1,57 +1,146 @@
+// controllers/productController.js
 require("dotenv").config({ path: `./.env.${process.env.NODE_ENV}` });
+const fs = require("fs");
+const csv = require("csv-parser");
 const { validateProduct } = require("../utils/validators/fieldsValidator");
 const Product = require("../models/product");
 const Notify = require("../models/notify");
 const slugify = require("slugify");
-const bucketName = process.env.AWS_BUCKET_NAME;
-const region = process.env.AWS_BUCKET_REGION;
 const { commonResponse } = require("../utils/reponse/response");
-const { S3Client } = require("@aws-sdk/client-s3");
-const { PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const sendNotifyEmail = require("../utils/EmailTemplate/NotifyEmail");
-require("dotenv").config();
-// Auth
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+// concurrency limiter to avoid AWS throttling when many presigned urls
+const pLimit = require("p-limit");
+
+// --- Config & single S3 client (reused) ---
 const awsAccessKey = process.env.AWS_ACCESS_KEY;
 const awsSecretKey = process.env.AWS_SECRET_KEY;
+const region = process.env.AWS_BUCKET_REGION || "ap-south-1";
+const bucketName = process.env.AWS_BUCKET_NAME;
 
-const makeCall = async (image) => {
-  s3 = new S3Client({
-    credentials: {
-      accessKeyId: awsAccessKey,
-      secretAccessKey: awsSecretKey,
-    },
-    region: "ap-south-1",
-  });
-  const par = {
-    Bucket: "prem-industries-ecom-images",
-    Key: image,
-  };
-  const command = new GetObjectCommand(par);
-  const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
-  return url;
-};
+// Single S3 client used for both presign and put operations
+const s3Client = new S3Client({
+  region,
+  credentials: {
+    accessKeyId: awsAccessKey,
+    secretAccessKey: awsSecretKey,
+  },
+});
 
-const processImages = async (features) => {
-  let result;
-  let temp = features;
-  for (let i = 0; i < features?.length; i++) {
-    result = await makeCall(features[i]?.image);
-    temp[i]["image"] = result;
+// Helper: build public S3 URL (keeps your current public-read approach)
+const buildPublicUrl = (key) =>
+  `https://${bucketName}.s3.${region}.amazonaws.com/${encodeURIComponent(key)}`;
+
+// --- makeCall: returns presigned URL for a single key ---
+// We keep this function for backward compatibility (some endpoints might expect presigned URL).
+// It uses the shared s3Client. It no longer recreates the client each invocation.
+const makeCall = async (imageKey, expiresIn = 3600) => {
+  if (!imageKey) return null;
+  try {
+    const params = { Bucket: bucketName, Key: imageKey };
+    const command = new GetObjectCommand(params);
+    // generate presigned URL
+    const url = await getSignedUrl(s3Client, command, { expiresIn });
+    return url;
+  } catch (err) {
+    console.error("makeCall error for key:", imageKey, err);
+    // Fallback: return public url if presign fails
+    return buildPublicUrl(imageKey);
   }
-  return temp;
 };
+
+// --- remove this line if present ---
+// const pLimit = require("p-limit");
+
+// --- small concurrency runner (no external deps) ---
+// runs an array of async tasks (functions returning promises) with concurrency limit
+const runWithConcurrency = async (taskFns = [], concurrency = 10) => {
+  const results = new Array(taskFns.length);
+  let inFlight = 0;
+  let idx = 0;
+
+  return new Promise((resolve, reject) => {
+    const launchNext = () => {
+      // finished all
+      if (idx >= taskFns.length && inFlight === 0) return resolve(results);
+
+      while (inFlight < concurrency && idx < taskFns.length) {
+        const currentIndex = idx++;
+        inFlight++;
+
+        // call the task function
+        taskFns[currentIndex]()
+          .then((r) => {
+            results[currentIndex] = r;
+          })
+          .catch((err) => {
+            // capture error result and continue (so one failure doesn't break everything)
+            results[currentIndex] = { error: String(err) };
+            console.error("task error:", err);
+          })
+          .finally(() => {
+            inFlight--;
+            launchNext();
+          });
+      }
+    };
+
+    // early resolve for empty
+    if (taskFns.length === 0) return resolve(results);
+    launchNext();
+  });
+};
+
+// --- updated processImages using runWithConcurrency ---
+const processImages = async (features = [], options = {}) => {
+  if (!features || features.length === 0) return features;
+
+  const concurrency = options.concurrency || 10;
+  const expiresIn = options.expiresIn || 3600;
+
+  // create task functions for each image element
+  const taskFns = features.map((feat) => async () => {
+    try {
+      const key = typeof feat === "string" ? feat : feat.image;
+      if (!key)
+        return typeof feat === "string"
+          ? { image: null }
+          : { ...feat, image: null };
+
+      // try presigned url (keeps original logic), fallback to public url
+      const signed = await makeCall(key, expiresIn);
+      if (typeof feat === "string")
+        return { image: signed || buildPublicUrl(key) };
+      return { ...feat, image: signed || buildPublicUrl(key) };
+    } catch (err) {
+      console.error("processImages item error:", err);
+      const key = typeof feat === "string" ? feat : feat.image;
+      return typeof feat === "string"
+        ? { image: buildPublicUrl(key) }
+        : { ...feat, image: buildPublicUrl(key) };
+    }
+  });
+
+  // run tasks with concurrency limit
+  const processed = await runWithConcurrency(taskFns, concurrency);
+
+  // processed is an array of objects in same order as features
+  return processed;
+};
+
+// -------------------- Exported endpoints --------------------
 
 exports.uploadImage = async (req, res) => {
   try {
-    const s3 = new S3Client({
-      credentials: {
-        accessKeyId: awsAccessKey,
-        secretAccessKey: awsSecretKey,
-      },
-      region: region,
-    });
+    if (!req.file) {
+      return res.status(400).json(commonResponse("File is required", false));
+    }
 
     const params = {
       Bucket: bucketName, // use env bucket
@@ -62,9 +151,9 @@ exports.uploadImage = async (req, res) => {
     };
 
     const command = new PutObjectCommand(params);
-    await s3.send(command);
+    await s3Client.send(command);
 
-    const url = `https://${bucketName}.s3.${region}.amazonaws.com/${req.file.originalname}`;
+    const url = buildPublicUrl(req.file.originalname);
 
     return res.status(201).json(
       commonResponse("image uploaded", true, {
@@ -87,7 +176,7 @@ exports.getImage = async (req, res) => {
         .json(commonResponse("Image key is required", false));
     }
 
-    const url = `https://${bucketName}.s3.${region}.amazonaws.com/${image}`;
+    const url = buildPublicUrl(image);
 
     return res.status(200).json(commonResponse("Image fetched", true, { url }));
   } catch (error) {
@@ -203,7 +292,6 @@ exports.createProduct = async (req, res) => {
 exports.getProductById = async (req, res) => {
   try {
     const { id } = req.params;
-    //console.log("204", req.params);
     const data = await Product.findOne({ _id: id }).populate("brand").exec();
 
     if (!data) {
@@ -223,7 +311,6 @@ exports.getProductById = async (req, res) => {
 exports.getProduct = async (req, res) => {
   try {
     const { slug } = req.params;
-    // console.log("slug:", slug); auth
 
     const slugPattern = new RegExp(
       `^${slug.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&")}$`,
@@ -257,21 +344,27 @@ exports.getProducts = async (req, res) => {
 
     const skip = (page - 1) * limit;
 
+    // keep exact count as before
     const totalProducts = await Product.countDocuments();
 
+    // use .lean() to reduce overhead and speed up serialization
     let products = await Product.find()
       .skip(skip)
       .limit(limit)
       .populate("brand category sub_category")
+      .lean()
       .exec();
 
-    // Process images
-    for (let i = 0; i < products.length; i++) {
-      if (products[i]?.images?.length > 0) {
-        const result = await processImages(products[i].images);
-        products[i].images = result;
+    // Process images in parallel across products (instead of sequentially)
+    const productImagePromises = products.map(async (prod) => {
+      if (prod?.images && prod.images.length > 0) {
+        const result = await processImages(prod.images);
+        prod.images = result;
       }
-    }
+      return prod;
+    });
+
+    await Promise.all(productImagePromises);
 
     // 🔥 RETURN ONLY ARRAY + TOTAL — NO PAGINATION OBJECT!
     return res.status(200).json({
@@ -336,9 +429,6 @@ exports.updateProduct = async (req, res) => {
       relatedProducts,
     } = req.body;
 
-    // console.log(req.body);
-
-    // Update the product using async/await
     const productUpdate = {
       brand,
       name,
@@ -384,11 +474,8 @@ exports.updateProduct = async (req, res) => {
       { $set: productUpdate },
       { new: true }
     ).exec();
-    // console.log(data);
-    // Update the priceList separately
 
     try {
-      // Check if data and priceList exist and the first element of priceList contains stock_quantity
       if (
         data &&
         priceList &&
@@ -414,15 +501,12 @@ exports.updateProduct = async (req, res) => {
             });
 
             if (notifications.length > 0) {
-              // Extract email addresses from fetched data
               const emailAddresses = notifications.map(
                 (notification) => notification.email_address
               );
 
-              // Send notification emails
               sendNotifyEmail(emailAddresses, "Product back in Stock", data);
 
-              // Update notifications to set mail_sent to true
               const notificationIds = notifications.map(
                 (notification) => notification._id
               );
@@ -430,27 +514,13 @@ exports.updateProduct = async (req, res) => {
                 { _id: { $in: notificationIds } },
                 { $set: { mail_sent: true } }
               );
-
-              // console.log("Emails sent and notifications updated successfully");
-            } else {
-              // console.log("No pending notifications to send");
             }
-
-            // console.log(
-            //   `Change in stock quantity detected: ${existingStockQuantity} -> ${newStockQuantity}`
-            // );
           }
-        } else {
-          // console.log("stock quantity greater than zero or no change");
         }
-      } else {
-        // console.log("Data or price list is missing or incorrectly formatted.");
       }
     } catch (error) {
       console.error("Error occurred while checking stock quantity:", error);
     }
-
-    //console.log("check 2");
 
     if (data) {
       const priceListUpdate = await Product.updateOne(
@@ -467,7 +537,6 @@ exports.updateProduct = async (req, res) => {
       res.status(400).json(commonResponse("Product not updated", false));
     }
   } catch (error) {
-    // Handle any errors that occur during the update operation
     console.error(error);
     res.status(500).json(commonResponse("Internal server error", false));
   }
@@ -477,7 +546,6 @@ exports.deleteProduct = async (req, res) => {
   const { id } = req.body;
 
   try {
-    // Use the 'deleteMany' method to delete products by their IDs
     const data = await Product.deleteMany({ _id: { $in: id } }).exec();
 
     if (data.deletedCount > 0) {
@@ -488,7 +556,6 @@ exports.deleteProduct = async (req, res) => {
         .json(commonResponse("No products found for deletion", false));
     }
   } catch (error) {
-    // Handle any errors that may occur during the deletion process
     console.error("Error deleting products:", error);
     res.status(500).json(commonResponse("Error deleting products", false));
   }
@@ -519,8 +586,7 @@ exports.searchProduct = async (req, res) => {
 
 exports.searchMainProducts = async (req, res) => {
   try {
-    const searchQuery = req.body.search; // Assuming the search characters are sent as 'search' in the request query
-    //console.log(searchQuery);
+    const searchQuery = req.body.search;
     const filter = {
       $or: [
         { name: { $regex: searchQuery, $options: "i" } },
@@ -554,12 +620,15 @@ exports.allProducts = async (req, res) => {
       return res.status(404).json(commonResponse("Products not found", false));
     }
 
-    for (let i = 0; i < data.length; i++) {
-      if (data[i].images && data[i].images.length > 0) {
-        const result = await processImages(data[i].images);
-        data[i].images = result;
+    // process images in parallel for all products
+    const proms = data.map(async (p) => {
+      if (p.images && p.images.length > 0) {
+        const result = await processImages(p.images);
+        p.images = result;
       }
-    }
+      return p;
+    });
+    await Promise.all(proms);
 
     res.status(200).json(commonResponse("Products found", true, data));
   } catch (error) {
@@ -578,7 +647,6 @@ exports.countProducts = async (req, res) => {
       res.status(404).json(commonResponse("Products not found", false));
     }
   } catch (error) {
-    // Handle the error gracefully
     console.error("Error while counting products:", error);
     res.status(500).json(commonResponse("Internal server error", false));
   }
@@ -588,25 +656,20 @@ exports.filterProducts = async (req, res) => {
   try {
     const { length, breadth, height, category, brand, subcategory, q, unit } =
       req.body;
-    //console.log(req.body);
 
     let dimensionField;
-    let unitField;
-
     if (unit === "inches") {
       dimensionField = {
         length: "length_inch",
         breadth: "breadth_inch",
         height: "height_inch",
       };
-      unitField = "inches";
     } else {
       dimensionField = {
         length: "length_mm",
         breadth: "breadth_mm",
         height: "height_mm",
       };
-      unitField = "mm";
     }
 
     const filter = {
@@ -634,17 +697,18 @@ exports.filterProducts = async (req, res) => {
       ...(q && { name: { $regex: q, $options: "i" } }),
     };
 
-    //console.log("538", filter);
-
     const data = await Product.find(filter).sort({ _id: 1 }).exec();
 
     if (data && data.length > 0) {
-      for (let i = 0; i < data.length; i++) {
-        if (data[i]?.images?.length > 0) {
-          const result = await processImages(data[i]?.images);
-          data[i]["images"] = result;
+      const proms = data.map(async (d) => {
+        if (d?.images?.length > 0) {
+          const result = await processImages(d?.images);
+          d.images = result;
         }
-      }
+        return d;
+      });
+      await Promise.all(proms);
+
       res.status(200).json(commonResponse("Products found", true, data));
     } else {
       res.status(404).json(commonResponse("Products not found", false));
@@ -659,7 +723,6 @@ exports.filterBoppProducts = async (req, res) => {
   try {
     const { length, width, thickness, category, brand, subcategory, q } =
       req.body;
-    //console.log("552", req.body);
 
     let lenMin, lenMax, widMin, widMax, thickMin, thickMax;
 
@@ -676,8 +739,6 @@ exports.filterBoppProducts = async (req, res) => {
       thickMax = parseFloat(thickness.max);
     }
 
-    // const categoryFilter = { category: "6557df64301ec4f2f4266141" };
-
     const filter = {
       ...(length && { length: { $gte: lenMin, $lte: lenMax } }),
       ...(width && { breadth_mm: { $gte: widMin, $lte: widMax } }),
@@ -689,19 +750,19 @@ exports.filterBoppProducts = async (req, res) => {
       ...(subcategory && { sub_category: subcategory }),
       ...(q && { name: { $regex: q, $options: "i" } }),
     };
-    //console.log("579", filter);
 
     const data = await Product.find(filter).sort({ _id: 1 }).exec();
 
-    // console.log("582", data);
-
     if (data && data.length > 0) {
-      for (let i = 0; i < data.length; i++) {
-        if (data[i]?.images?.length > 0) {
-          const result = await processImages(data[i]?.images);
-          data[i]["images"] = result;
+      const proms = data.map(async (d) => {
+        if (d?.images?.length > 0) {
+          const result = await processImages(d?.images);
+          d.images = result;
         }
-      }
+        return d;
+      });
+      await Promise.all(proms);
+
       res.status(200).json(commonResponse("Products found", true, data));
     } else {
       res.status(404).json(commonResponse("Products not found", false));
@@ -714,25 +775,20 @@ exports.filterBoppProducts = async (req, res) => {
 
 exports.filterLabelProducts = async (req, res) => {
   try {
-    const { length, breadth, height, category, brand, subcategory, q, unit } =
-      req.body;
-    //console.log(req.body);
+    const { length, breadth, category, brand, subcategory, q, unit } = req.body;
 
     let dimensionField;
-    let unitField;
 
     if (unit === "inches") {
       dimensionField = {
         length: "length_inch",
         breadth: "breadth_inch",
       };
-      unitField = "inches";
     } else {
       dimensionField = {
         length: "length_mm",
         breadth: "breadth_mm",
       };
-      unitField = "mm";
     }
 
     const filter = {
@@ -754,17 +810,18 @@ exports.filterLabelProducts = async (req, res) => {
       ...(q && { name: { $regex: q, $options: "i" } }),
     };
 
-    //console.log("538", filter);
-
     const data = await Product.find(filter).sort({ _id: 1 }).exec();
 
     if (data && data.length > 0) {
-      for (let i = 0; i < data.length; i++) {
-        if (data[i]?.images?.length > 0) {
-          const result = await processImages(data[i]?.images);
-          data[i]["images"] = result;
+      const proms = data.map(async (d) => {
+        if (d?.images?.length > 0) {
+          const result = await processImages(d?.images);
+          d.images = result;
         }
-      }
+        return d;
+      });
+      await Promise.all(proms);
+
       res.status(200).json(commonResponse("Products found", true, data));
     } else {
       res.status(404).json(commonResponse("Products not found", false));
@@ -808,12 +865,15 @@ exports.filterPolyProducts = async (req, res) => {
     const data = await Product.find(filter).sort({ _id: 1 }).exec();
 
     if (data && data.length > 0) {
-      for (let i = 0; i < data.length; i++) {
-        if (data[i]?.images?.length > 0) {
-          const result = await processImages(data[i]?.images);
-          data[i]["images"] = result;
+      const proms = data.map(async (d) => {
+        if (d?.images?.length > 0) {
+          const result = await processImages(d?.images);
+          d.images = result;
         }
-      }
+        return d;
+      });
+      await Promise.all(proms);
+
       res.status(200).json(commonResponse("Products found", true, data));
     } else {
       res.status(404).json(commonResponse("Products not found", false));
@@ -828,21 +888,14 @@ exports.SingleProduct = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Attempt to find the product by ID and populate the 'brand' field
     const data = await Product.findOne({ _id: id }).populate("brand").exec();
 
     if (!data) {
-      // If no product is found, send a 404 (Not Found) response
       return res.status(404).json({ message: "Product not found" });
     }
 
-    // const image = await processImages(data?.images);
-    // data.images = image;
-
-    // If a product is found, send a 200 (OK) response
     res.status(200).json({ message: "Product found", data });
   } catch (error) {
-    // Handle any errors that occur during the database query
     console.error("Error fetching product:", error);
     res.status(500).json({ message: "Internal server error" });
   }
@@ -852,21 +905,17 @@ exports.SingleProductWithImage = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Attempt to find the product by ID and populate the 'brand' field
     const data = await Product.findOne({ _id: id }).populate("brand").exec();
 
     if (!data) {
-      // If no product is found, send a 404 (Not Found) response
       return res.status(404).json({ message: "Product not found" });
     }
 
     const image = await processImages(data?.images);
     data.images = image;
 
-    // If a product is found, send a 200 (OK) response
     res.status(200).json({ message: "Product found", data });
   } catch (error) {
-    // Handle any errors that occur during the database query
     console.error("Error fetching product:", error);
     res.status(500).json({ message: "Internal server error" });
   }
@@ -883,7 +932,6 @@ exports.uploadCSV = async (req, res) => {
       .pipe(csv())
       .on("data", (data) => results.push(data))
       .on("end", async () => {
-        // Process the CSV data and save to the database
         for (const row of results) {
           const product = new Product({ ...row });
           await product.save();
@@ -891,6 +939,7 @@ exports.uploadCSV = async (req, res) => {
         res.json({ message: "CSV file uploaded successfully" });
       });
   } catch (error) {
+    console.error("Error uploading CSV:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };
