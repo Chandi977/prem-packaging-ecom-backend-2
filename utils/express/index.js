@@ -29,7 +29,7 @@ module.exports = () => {
           "http://localhost:3000",
           "http://localhost:3001",
           "https://prem-packaging-ecom-frontend-9fab2c.vercel.app",
-          "https://prem-packaging-ecom-admin-dashboard-three.vercel.app"
+          "https://prem-packaging-ecom-admin-dashboard-j9lr6a4g4.vercel.app"
         ],
         credentials: true,
       })
